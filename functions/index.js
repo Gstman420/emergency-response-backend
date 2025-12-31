@@ -1,108 +1,105 @@
 const { onDocumentCreated } = require("firebase-functions/v2/firestore");
 const logger = require("firebase-functions/logger");
-
 const admin = require("firebase-admin");
 
-// ✅ Initialize Admin SDK ONCE
-admin.initializeApp();
+// Safe initialization (important for emulator + prod)
+if (!admin.apps.length) {
+  admin.initializeApp();
+}
 
 const db = admin.firestore();
+const { FieldValue } = admin.firestore; // 🔥 THIS FIXES YOUR ERROR
 
 /**
- * Score emergency priority
+ * Emergency priority scoring
  */
 function scoreEmergency(emergency) {
   let score = emergency.severity * 10;
 
   if (emergency.type === "fire") score += 5;
   if (emergency.type === "medical") score += 3;
-  if (emergency.type === "accident") score += 4;
+  if (emergency.type === "police") score += 2;
 
   return score;
 }
 
 /**
- * Trigger when emergency is created
+ * Firestore Trigger
  */
 exports.onEmergencyCreate = onDocumentCreated(
   "emergencies/{emergencyId}",
   async (event) => {
-    logger.info("🚨 Emergency created");
+    try {
+      logger.info("🚨 Emergency created");
 
-    const snapshot = event.data;
-    if (!snapshot) return;
+      const newEmergency = event.data.data();
+      const emergencyId = event.params.emergencyId;
 
-    // Get open emergencies
-    const emergenciesSnap = await db
-      .collection("emergencies")
-      .where("status", "==", "open")
-      .get();
+      if (!newEmergency?.requiredResource) {
+        logger.warn("❗ Emergency missing requiredResource");
+        return;
+      }
 
-    // Get available resources
-    const resourcesSnap = await db
-      .collection("resources")
-      .where("available", "==", true)
-      .get();
+      // Fetch active emergencies
+      const snapshot = await db
+        .collection("emergencies")
+        .where("status", "==", "active")
+        .get();
 
-    if (emergenciesSnap.size <= resourcesSnap.size) {
-      logger.info("ℹ️ Only one emergency — no deadlock possible");
-      return;
-    }
+      if (snapshot.size <= 1) {
+        logger.info("ℹ️ Only one emergency — no deadlock possible");
+        return;
+      }
 
-    logger.warn("⚠️ DEADLOCK DETECTED");
-
-    // Create context request for human decision
-    await db.collection("context_requests").add({
-      emergencies: emergenciesSnap.docs.map((doc) => ({
+      const emergencies = snapshot.docs.map((doc) => ({
         id: doc.id,
         ...doc.data(),
-        score: scoreEmergency(doc.data()),
-      })),
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      }));
 
-      status: "pending",
-    });
+      // Check for resource conflict
+      const conflict = emergencies.filter(
+        (e) =>
+          e.requiredResource === newEmergency.requiredResource &&
+          e.id !== emergencyId
+      );
 
-    logger.info("🧠 Context request created");
-  }
-);
+      if (conflict.length === 0) return;
 
-/**
- * Trigger when human responds
- */
-exports.onContextResponseCreate = onDocumentCreated(
-  "context_responses/{responseId}",
-  async (event) => {
-    logger.info("👤 Human response received");
+      logger.warn("⚠️ DEADLOCK DETECTED");
 
-    const data = event.data.data();
-    const chosenEmergencyId = data.chosenEmergencyId;
+      // Score & sort
+      conflict.push({ id: emergencyId, ...newEmergency });
 
-    // Assign emergency
-    await db.collection("emergencies").doc(chosenEmergencyId).update({
-      status: "assigned",
-    });
-
-    // Allocate one available resource
-    const resourceSnap = await db
-      .collection("resources")
-      .where("available", "==", true)
-      .limit(1)
-      .get();
-
-    if (!resourceSnap.empty) {
-      await resourceSnap.docs[0].ref.update({
-        available: false,
+      conflict.forEach((e) => {
+        e.priorityScore = scoreEmergency(e);
       });
+
+      conflict.sort((a, b) => b.priorityScore - a.priorityScore);
+
+      // Highest priority keeps resource
+      const winner = conflict[0];
+      const losers = conflict.slice(1);
+
+      const batch = db.batch();
+
+      losers.forEach((e) => {
+        batch.update(db.collection("emergencies").doc(e.id), {
+          status: "waiting",
+          deadlockDetected: true,
+          updatedAt: FieldValue.serverTimestamp(), // ✅ FIXED
+        });
+      });
+
+      batch.update(db.collection("emergencies").doc(winner.id), {
+        deadlockResolved: true,
+        updatedAt: FieldValue.serverTimestamp(), // ✅ FIXED
+      });
+
+      await batch.commit();
+
+      logger.info("✅ Deadlock resolved successfully");
+    } catch (error) {
+      logger.error("🔥 Backend crash:", error);
     }
-
-    // Log decision
-    await db.collection("decisions").add({
-      emergencyId: chosenEmergencyId,
-      resolvedBy: "human",
-      resolvedAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-
-    logger.info("✅ Emergency resolved via human decision");
   }
 );
